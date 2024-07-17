@@ -1,0 +1,1 @@
+# ManageWP-console-updater
