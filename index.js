@@ -2,6 +2,12 @@ const axios = require('axios');
 const { prompt } = require('inquirer');
 const cliProgress = require('cli-progress');
 require('dotenv').config();
+let open;
+import('open').then(module => {
+    open = module.default;
+}).catch(err => {
+    console.error('Failed to import open:', err);
+});
 
 const MAINWP_DASHBOARD_URL = process.env.MAINWP_DASHBOARD_URL || 'https://wpmanage.greenwich-design.co.uk';
 const CONSUMER_KEY = process.env.WP_MANAGE_CONSUMER_KEY;
@@ -23,6 +29,34 @@ function getColorForSecurity(securityIssues) {
     if (securityIssues === 0) return GREEN;
     if (securityIssues < 5) return YELLOW;
     return RED;
+}
+
+async function forceSiteSync(siteId) {
+    const endpoint = `${MAINWP_DASHBOARD_URL}/wp-json/mainwp/v1/site/sync-site`;
+    try {
+        const response = await axios.post(endpoint, null, {
+            params: { consumer_key: CONSUMER_KEY, consumer_secret: CONSUMER_SECRET, site_id: siteId }
+        });
+        console.log('Site sync initiated:', response.data);
+        return response.data;
+    } catch (error) {
+        console.error(`Error syncing site ${siteId}:`, error.message);
+        return null;
+    }
+}
+
+async function purgeCache(siteId) {
+    const endpoint = `${MAINWP_DASHBOARD_URL}/wp-json/mainwp/v1/site/purge-cache`;
+    try {
+        const response = await axios.post(endpoint, null, {
+            params: { consumer_key: CONSUMER_KEY, consumer_secret: CONSUMER_SECRET, site_id: siteId }
+        });
+        console.log('Cache purge response:', response.data);
+        return response.data;
+    } catch (error) {
+        console.error(`Error purging cache for site ${siteId}:`, error.message);
+        return null;
+    }
 }
 
 async function fetchSitesWithUpdates() {
@@ -129,10 +163,24 @@ async function listWPManageSites() {
 
             const sites = response.data;
             if (typeof sites === 'object' && sites !== null) {
-                const choices = Object.entries(sites).map(([id, site]) => ({
-                    name: `${site.name}${RESET} - ${getColorForSecurity(site.securityIssues)}Security issues: ${site.securityIssues}${RESET} - ${getColorForHealth(site.health_value)} Health: ${site.health_value}%${RESET}`,
-                    value: { id, ...site }
-                }));
+                const choices = Object.entries(sites).map(([id, site]) => {
+                    const pluginUpdates = JSON.parse(site.plugin_upgrades || '{}');
+                    const pluginUpdateCount = Object.keys(pluginUpdates).length;
+                    const wpUpgrades = JSON.parse(site.wp_upgrades || '[]');
+                    const hasCoreUpdate = wpUpgrades.length > 0;
+                
+                    let siteInfo = {};
+                    try {
+                        siteInfo = JSON.parse(site.site_info || '{}');
+                    } catch (error) {
+                        console.error(`Error parsing site_info for ${site.name}:`, error.message);
+                    }
+                
+                    return {
+                        name: `${site.name}${RESET} - ${getColorForSecurity(site.securityIssues)}Security: ${site.securityIssues}${RESET} - ${getColorForHealth(site.health_value)}Health: ${site.health_value}%${RESET} - ${hasCoreUpdate ? RED + 'Core update' : GREEN + 'Core OK'}${RESET} - ${pluginUpdateCount > 0 ? YELLOW : GREEN}Plugins: ${pluginUpdateCount}${RESET}`,
+                        value: { id, ...site }
+                    };
+                });
 
                 choices.push({ name: 'Exit', value: 'exit' });
 
@@ -159,15 +207,30 @@ async function listWPManageSites() {
                     console.log('URL:', selectedSite.url);
                     console.log(`Security issues: ${getColorForSecurity(selectedSite.securityIssues)}${selectedSite.securityIssues}${RESET}`);
                     console.log(`Site health: ${getColorForHealth(selectedSite.health_value)}${selectedSite.health_value}${RESET}`);
-                    console.log('WordPress version:', siteDetails.wp_version);
-                    console.log('Site health status:', siteDetails.health_status || 'N/A');
-
-                    // if (siteDetails.plugin_upgrades) {
-                    //     console.log('\nPlugins needing updates:');
-                    //     Object.entries(siteDetails.plugin_upgrades).forEach(([plugin, info]) => {
-                    //         console.log(`- ${plugin}: ${info.update.new_version}`);
-                    //     });
-                    // }
+                    
+                    // Parse site_info JSON if it exists
+                    let siteInfo = {};
+                    try {
+                        siteInfo = JSON.parse(siteDetails.site_info || '{}');
+                    } catch (error) {
+                        console.error('Error parsing site_info:', error.message);
+                    }
+                
+                    console.log('WordPress Version:', siteInfo.wpversion || siteDetails.wp_version || 'Unknown');
+                    console.log('Debug Mode:', siteInfo.debug_mode ? 'Enabled' : 'Disabled');
+                    console.log('PHP Version:', siteInfo.phpversion || siteDetails.phpversion || 'Unknown');
+                    console.log('MainWP Child Version:', siteInfo.child_version || 'Unknown');
+                    console.log('PHP Memory Limit:', siteInfo.memory_limit || 'Unknown');
+                    console.log('MySQL Version:', siteInfo.mysql_version || 'Unknown');
+                    console.log('cURL version:', siteInfo.child_curl_version || 'Unknown');
+                    console.log('OpenSSL version:', siteInfo.child_openssl_version || 'Unknown');
+                    console.log('Server IP:', siteInfo.ip || siteDetails.ip || 'Unknown');
+                    console.log('Last Check Status:', `${siteDetails.http_response_code} - ${siteDetails.http_response_code === '200' ? 'OK' : 'Error'}`);
+                
+                    // If tags are available, display them
+                    if (siteDetails.tags) {
+                        console.log('Tags:', siteDetails.tags);
+                    }
 
                     const { performUpdates } = await prompt({
                         type: 'confirm',
@@ -181,23 +244,36 @@ async function listWPManageSites() {
                         const wpUpdateResult = await updateWordPress(selectedSite.id);
                         if (wpUpdateResult) {
                             console.log('WordPress core update response:', wpUpdateResult);
+                            
+                            // Attempt to purge cache after core update
+                            console.log('Attempting to purge cache...');
+                            await purgeCache(selectedSite.id);
                         } else {
                             console.log('No WordPress core update was necessary or the update failed.');
                         }
-
+                    
                         if (siteDetails.plugin_upgrades && Object.keys(JSON.parse(siteDetails.plugin_upgrades)).length > 0) {
                             console.log('\nInitiating plugins update...');
                             const pluginUpdateResult = await updatePlugins(selectedSite.id);
                             if (pluginUpdateResult) {
                                 console.log('Plugin update response:', pluginUpdateResult);
+                                
+                                // Attempt to purge cache after plugin updates
+                                console.log('Attempting to purge cache...');
+                                await purgeCache(selectedSite.id);
                             } else {
                                 console.log('Plugin update failed or no updates were necessary.');
                             }
                         } else {
                             console.log('\nNo plugin updates available according to MainWP data.');
                         }
-
-                        console.log('\nUpdate requests sent. Please check the MainWP dashboard for detailed update status.');
+                    
+                        console.log('\nForcing WP Manage to sync with the updated site...');
+                        await forceSiteSync(selectedSite.id);
+                    
+                        console.log('Waiting for sync to complete...');
+                        await new Promise(resolve => setTimeout(resolve, 10000)); // Wait for 10 seconds
+                    
                         console.log('Fetching latest site details...');
                         const updatedSiteDetails = await fetchSiteDetails(selectedSite.id);
                         if (updatedSiteDetails) {
@@ -205,6 +281,23 @@ async function listWPManageSites() {
                             console.log('Current WordPress version:', siteInfo.wpversion || 'Unknown');
                             const pluginUpgrades = JSON.parse(updatedSiteDetails.plugin_upgrades || '{}');
                             console.log('Current plugin updates available:', Object.keys(pluginUpgrades).length);
+                            
+                            // Ask user if they want to open the site in browser
+                            const { openBrowser } = await prompt({
+                                type: 'confirm',
+                                name: 'openBrowser',
+                                message: 'Do you want to open this site in your browser?',
+                                default: true
+                            });
+                    
+                            if (openBrowser) {
+                                if (open) {
+                                    console.log('Opening site in browser...');
+                                    await open(selectedSite.url);
+                                } else {
+                                    console.log('Unable to open browser: open module not loaded');
+                                }
+                            }
                         }
                     }
                 }
@@ -229,3 +322,6 @@ listWPManageSites()
         console.error(error);
         process.exit(1);
     });
+
+
+    
